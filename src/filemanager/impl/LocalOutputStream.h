@@ -1,1 +1,1 @@
-mutable std::ofstream stream_; 
+mutable std::ofstream stream_;

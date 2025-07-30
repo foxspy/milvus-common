@@ -40,7 +40,7 @@ public:
     /**
      * @brief read data from the stream to a object with given type
      *
-     * @param 
+     * @param
      * @return
      */
     template <typename T>

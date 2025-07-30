@@ -21,7 +21,7 @@ add_executable(cachinglayer_test
 )
 
 target_link_libraries(cachinglayer_test
-    gtest 
+    gtest
     gmock
     milvus-common
     pthread

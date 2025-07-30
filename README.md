@@ -13,4 +13,3 @@ Milvus Common is a core component library that serves as a bridge between Milvus
 - `Monitor`: Metrics collection and monitoring
 
 ### Log Module
-
