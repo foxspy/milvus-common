@@ -21,6 +21,7 @@
 #include <mutex>
 #include <memory>
 #include <queue>
+#include <cassert>
 #include <thread>
 #include <vector>
 #include <utility>
