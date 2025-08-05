@@ -28,6 +28,9 @@ public:
         return Read(&value, sizeof(T));
     }
 
+    size_t
+    Read(int fd, size_t size) override;
+
     bool
     Eof() const override;
 

@@ -23,6 +23,9 @@ public:
         return Write(&value, sizeof(T));
     }
 
+    size_t
+    Write(int fd, size_t size) override;
+
 private:
     mutable std::ofstream stream_;
     std::string filename_;
