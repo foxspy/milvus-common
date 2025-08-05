@@ -72,5 +72,15 @@ public:
     Read(T& value) {
         return Read(&value, sizeof(T));
     }
+
+    /**
+     * @brief read data from the stream to a file
+     *
+     * @param file
+     * @param size
+     * @return the number of bytes read
+     */
+    virtual size_t
+    Read(int fd, size_t size) = 0;
 };
 }  // namespace milvus

@@ -48,5 +48,16 @@ public:
     Write(const T& value) {
         return Write(&value, sizeof(T));
     }
+
+    /**
+     * @brief write data from a file to the stream
+     *
+     * @param file
+     * @param size
+     * @return the number of bytes written
+     */
+
+    virtual size_t
+    Write(int fd, size_t size) = 0;
 };
 }  // namespace milvus
