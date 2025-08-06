@@ -76,6 +76,7 @@ LocalInputStream::Read(int fd, size_t size) {
         total_read_size += read_size;
         remain_size -= write_size;
     }
+    ::fsync(fd);
 
     return total_read_size;
 }
