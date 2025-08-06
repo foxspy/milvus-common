@@ -1,4 +1,7 @@
 #include "filemanager/impl/LocalInputStream.h"
+#include <unistd.h>
+#include <algorithm>
+#include <vector>
 
 namespace milvus {
 
@@ -47,4 +50,35 @@ LocalInputStream::Read(void* ptr, size_t size) {
     stream_.read(static_cast<char*>(ptr), size);
     return stream_.gcount();
 }
+
+size_t
+LocalInputStream::Read(int fd, size_t size) {
+    size_t cur = stream_.tellg();
+    if (cur + size > size_) {
+        throw std::runtime_error("Read out of range");
+    }
+
+    size_t buffer_size = std::min(size, static_cast<size_t>(4096));
+    std::vector<char> buffer(buffer_size);
+
+    size_t remain_size = size;
+    size_t total_read_size = 0;
+
+    while (remain_size > 0) {
+        size_t write_size = std::min(remain_size, buffer_size);
+        size_t read_size = stream_.read(buffer.data(), write_size).gcount();
+        if (read_size != write_size) {
+            throw std::runtime_error("Read from stream " + filename_ + " failed");
+        }
+        if (::write(fd, buffer.data(), read_size) != read_size) {
+            throw std::runtime_error("Write to fd " + std::to_string(fd) + " failed");
+        }
+        total_read_size += read_size;
+        remain_size -= write_size;
+    }
+    ::fsync(fd);
+
+    return total_read_size;
+}
+
 }  // namespace milvus
