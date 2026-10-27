@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
+#include <fmt/ranges.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
@@ -405,7 +406,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
             auto run_load_internal = [&]() {
                 if (ctx && ctx->cancellation_token.isCancellationRequested()) {
-                    throw std::runtime_error("Operation cancelled, stop loading cache cells");
+                    ThrowInfo(ErrorCode::FollyCancel, "Operation cancelled, stop loading cache cells");
                 }
                 start = std::chrono::steady_clock::now();
                 auto results = translator_->get_cells(ctx, loading_cids);

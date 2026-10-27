@@ -1825,3 +1825,23 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
         EXPECT_EQ(cell->cid, cid);
     }
 }
+
+TEST_F(CacheSlotTest, CancelledLoadPreservesErrorCodeAndAllowsRetry) {
+    folly::CancellationSource source;
+    milvus::OpContext cancelled_context(source.getToken());
+    source.requestCancellation();
+    translator_->ResetCounters();
+    try {
+        cache_slot_->PinOneCellDirect(&cancelled_context, 30);
+        FAIL() << "Expected a typed cancellation before invoking the translator";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(translator_->GetCellsCallCount(), 0);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
+
+    milvus::OpContext active_context;
+    auto accessor = cache_slot_->PinOneCellDirect(&active_context, 30);
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(translator_->GetCellsCallCount(), 1);
+}
