@@ -23,6 +23,10 @@
 #include "cachinglayer/Utils.h"
 #include "common/EasyAssert.h"
 
+namespace milvus::cachinglayer {
+class SharedLoadTestFriend;
+}
+
 namespace milvus::cachinglayer::internal {
 
 class DList;
@@ -192,6 +196,7 @@ class ListNode {
 
  private:
     friend class DList;
+    friend class milvus::cachinglayer::SharedLoadTestFriend;
     friend class NodePin;
 
     friend class MockListNode;
