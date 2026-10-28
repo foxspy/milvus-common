@@ -19,7 +19,6 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <unordered_set>
 
 #include "cachinglayer/Utils.h"
@@ -31,8 +30,9 @@ namespace milvus::cachinglayer::internal {
 // worker needed to complete its download. Coroutine loads release workers on suspension.
 folly::Executor&
 SharedLoadExecutor();
-folly::Timekeeper&
-SharedLoadTimekeeper();
+// Dedicated, lazily grown pool; the caller can configure its concurrency through Manager.
+folly::CPUThreadPoolExecutor&
+SharedLoadThreadPool();
 
 struct SharedLoad {
     explicit SharedLoad(const OpContext* caller);
@@ -40,12 +40,10 @@ struct SharedLoad {
     OpContext context;
     std::unordered_set<cid_t> cids;
     folly::SharedPromise<folly::Unit> drained;
-    std::optional<folly::Future<folly::Unit>> deadline;
     // Protected by the owning CacheSlot's loads_mutex_.
     size_t waiters = 0;
     bool closing = false;
     bool finished = false;
-    bool timed_out = false;
 };
 
 // A request owns its result, never the shared producer's promise. Keep the

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <variant>
 
 #include "cachinglayer/Utils.h"
@@ -75,6 +76,11 @@ class ListNode {
     //   The node will not be pinned until the future is ready.
     std::pair<bool, std::variant<NodePin, folly::SemiFuture<NodePin>>>
     pin();
+
+    // Atomically pin a resident cell under the node lock. A miss has no side
+    // effects: only pin() may claim loading or join a pending load.
+    std::optional<NodePin>
+    try_pin();
 
     const ResourceUsage&
     loaded_size() const;
