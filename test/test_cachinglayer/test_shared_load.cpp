@@ -19,11 +19,18 @@
 #include <thread>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/Manager.h"
 #include "cachinglayer_test_utils.h"
 
 namespace milvus::cachinglayer {
 class SharedLoadTestFriend {
  public:
+    template <typename T>
+    static std::unique_lock<std::mutex>
+    LockLoads(CacheSlot<T>& slot) {
+        return std::unique_lock(slot.loads_mutex_);
+    }
+
     template <typename T>
     static int
     Pins(const CacheSlot<T>& slot, cid_t cid) {
@@ -247,6 +254,8 @@ TEST_P(SharedLoadCancellationTest, LastWaiterCancelsLoadButRetainsResourcesUntil
 }
 
 TEST_P(SharedLoadCancellationTest, AdmissionWaitSurvivesInitiatorCancellation) {
+    slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true, true,
+                                                   true, -1ms, 0ms);
     const ResourceUsage held{1000, 0};
     ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, 0ms)));
     folly::CancellationSource a_cancel;
@@ -282,6 +291,8 @@ TEST_P(SharedLoadCancellationTest, AdmissionWaitSurvivesInitiatorCancellation) {
 }
 
 TEST_P(SharedLoadCancellationTest, LastAdmissionWaiterCancelsBeforeDownload) {
+    slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true, true,
+                                                   true, -1ms, 0ms);
     const ResourceUsage held{1000, 0};
     ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, 0ms)));
     folly::CancellationSource a_cancel;
@@ -354,23 +365,105 @@ TEST_P(SharedLoadCancellationTest, BatchRemainsNeededByFollowerOfAnotherCell) {
     EXPECT_EQ(gate->calls, 1);
 }
 
-TEST_P(SharedLoadCancellationTest, IndependentLoadDeadlineCancelsUnderlyingWork) {
-    slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true, true,
-                                                   true, 50ms, 0ms);
-    OpContext caller;
-    Pending result;
-    auto release = folly::makeGuard([&] { gate->Release(); });
-    result = Pin(&caller);
-    ASSERT_TRUE(gate->Wait(&LoadGate::cancelled));
-    ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
-    try {
-        result.get();
-        FAIL() << "expected the load deadline";
-    } catch (const SegcoreError& e) {
-        EXPECT_EQ(e.get_error_code(), ErrorCode::FollyOtherException);
+TEST_P(SharedLoadCancellationTest, AdmissionTimeoutDoesNotLimitTranslation) {
+    // Cover default foreground/warmup settings and a short positive admission
+    // budget. Translation may outlive all of them while a caller still waits.
+    for (auto timeout : {-1ms, 0ms, 20ms}) {
+        SCOPED_TRACE(timeout.count());
+        gate = std::make_shared<LoadGate>();
+        slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true,
+                                                       true, true, timeout, 0ms);
+        OpContext caller;
+        Pending result;
+        auto release = folly::makeGuard([&] { gate->Release(); });
+        result = Pin(&caller);
+        ASSERT_TRUE(gate->Wait(&LoadGate::started));
+        {
+            std::unique_lock lock(gate->mutex);
+            EXPECT_FALSE(gate->cv.wait_for(lock, 100ms, [&] { return gate->cancelled; }));
+        }
+        EXPECT_EQ(result.wait_for(0ms), std::future_status::timeout);
+        gate->Release();
+        ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+        EXPECT_EQ(result.get()->get_cell_of(0)->id, 0);
+        SemiInlineGet(slot->WaitForLoads());
+        EXPECT_EQ(internal::DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
     }
-    EXPECT_FALSE(caller.cancellation_token.isCancellationRequested());
-    EXPECT_EQ(internal::DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST_P(SharedLoadCancellationTest, AdmissionTimeoutStillRejectsWhenResourcesAreUnavailable) {
+    for (auto timeout : {0ms, 20ms}) {
+        SCOPED_TRACE(timeout.count());
+        slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true,
+                                                       true, true, timeout, 0ms);
+        const ResourceUsage held{1000, 0};
+        ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, 0ms)));
+        Pending result;
+        auto release = folly::makeGuard([&] { dlist->ReleaseLoadingResource(held); });
+        result = Pin(nullptr);
+        ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+        try {
+            result.get();
+            FAIL() << "expected admission failure";
+        } catch (const SegcoreError& e) {
+            EXPECT_EQ(e.get_error_code(), ErrorCode::InsufficientResource);
+        }
+        EXPECT_EQ(gate->calls, 0);
+    }
+}
+
+TEST_P(SharedLoadCancellationTest, ResidentHitsDoNotWaitForSharedLoadMutex) {
+    gate->Release();
+    auto initial = Pin(nullptr).get();
+    initial.reset();  // Exercise CACHED -> pinned, not just an already-pinned cell.
+    OpContext caller;
+    auto lock = SharedLoadTestFriend::LockLoads(*slot);
+    auto result = Pin(&caller);
+    auto status = result.wait_for(1s);
+    lock.unlock();  // A failed fast path must not leave the test's future blocked.
+    ASSERT_EQ(status, std::future_status::ready);
+    auto accessor = result.get();
+    EXPECT_EQ(accessor->get_cell_of(0)->id, 0);
+    EXPECT_EQ(caller.storage_usage.scanned_cold_bytes.load(), 0);
+    EXPECT_EQ(caller.storage_usage.scanned_total_bytes.load(), 100);
+    EXPECT_FALSE(slot->ManualEvict(0));
+    accessor.reset();
+    EXPECT_TRUE(slot->ManualEvict(0));
+    EXPECT_EQ(gate->calls, 1);
+    EXPECT_EQ(internal::DListTestFriend::get_used_memory(*dlist), ResourceUsage{});
+}
+
+TEST_P(SharedLoadCancellationTest, PreCancelledResidentHitStillReturnsCancellation) {
+    gate->Release();
+    auto resident = Pin(nullptr).get();
+    folly::CancellationSource cancel;
+    cancel.requestCancellation();
+    OpContext caller(cancel.getToken());
+    auto result = Pin(&caller);
+    ExpectCancelled(result);
+    EXPECT_EQ(caller.storage_usage.scanned_total_bytes.load(), 0);
+    EXPECT_EQ(SharedLoadTestFriend::Pins(*slot, 0), 1);
+    EXPECT_EQ(gate->calls, 1);
+}
+
+TEST_P(SharedLoadCancellationTest, PartialResidentBatchFallsBackWithoutLeakingPins) {
+    if (GetParam() == 0)
+        GTEST_SKIP() << "requires the batch entry point";
+    gate->Release();
+    Pin(nullptr, {0}).get().reset();
+    OpContext caller;
+    auto accessor = Pin(&caller, {0, 1}).get();
+    EXPECT_EQ(accessor->get_cell_of(0)->id, 0);
+    EXPECT_EQ(accessor->get_cell_of(1)->id, 1);
+    EXPECT_EQ(SharedLoadTestFriend::Pins(*slot, 0), 1);
+    EXPECT_EQ(SharedLoadTestFriend::Pins(*slot, 1), 1);
+    EXPECT_EQ(caller.storage_usage.scanned_cold_bytes.load(), 100);
+    EXPECT_EQ(caller.storage_usage.scanned_total_bytes.load(), 200);
+    EXPECT_EQ(gate->calls, 2);
+    accessor.reset();
+    EXPECT_TRUE(slot->ManualEvict(0));
+    EXPECT_TRUE(slot->ManualEvict(1));
+    EXPECT_EQ(internal::DListTestFriend::get_used_memory(*dlist), ResourceUsage{});
 }
 
 TEST_P(SharedLoadCancellationTest, CompletionRacingCancellationLeavesFollowerSuccessful) {
@@ -439,7 +532,120 @@ TEST_P(SharedLoadCancellationTest, CancelledNewcomerDoesNotRestartDrainingLoad) 
     EXPECT_EQ(gate->calls, 1);
 }
 
+class ScopedLoadThreads {
+ public:
+    explicit ScopedLoadThreads(size_t count) : previous_(internal::SharedLoadThreadPool().numThreads()) {
+        Manager::SetLoadPoolThreads(count);
+    }
+    ~ScopedLoadThreads() {
+        Manager::SetLoadPoolThreads(previous_);
+    }
+
+ private:
+    size_t previous_;
+};
+
+TEST(SharedLoadExecutorTest, ConfiguredConcurrencyAllowsMoreThanEightLoads) {
+    ScopedLoadThreads threads(12);
+    auto dlist = std::make_shared<internal::DList>(true, ResourceUsage{10000, 0}, ResourceUsage{10000, 0},
+                                                   ResourceUsage{10000, 0}, EvictionConfig{10, false, 600});
+    std::vector<std::shared_ptr<LoadGate>> gates;
+    std::vector<std::shared_ptr<CacheSlot<SharedCell>>> slots;
+    std::vector<std::future<std::shared_ptr<CellAccessor<SharedCell>>>> results;
+    auto release = folly::makeGuard([&] {
+        for (const auto& gate : gates) gate->Release();
+    });
+    for (int i = 0; i < 12; ++i) {
+        auto gate = std::make_shared<LoadGate>();
+        gates.push_back(gate);
+        auto slot = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(gate), dlist.get(), true,
+                                                            true, true, -1ms, 0ms);
+        slots.push_back(slot);
+        results.push_back(std::async(std::launch::async, [slot] { return slot->PinOneCellDirect(nullptr, 0); }));
+        ASSERT_TRUE(gate->Wait(&LoadGate::started)) << "load " << i;
+    }
+    // All twelve are inside synchronous translation concurrently, not just queued.
+    for (const auto& gate : gates) gate->Release();
+    for (auto& result : results) EXPECT_EQ(result.get()->get_cell_of(0)->id, 0);
+}
+
+TEST(SharedLoadExecutorTest, QueueTimeDoesNotConsumeAdmissionTimeout) {
+    ScopedLoadThreads threads(1);
+    auto dlist = std::make_shared<internal::DList>(true, ResourceUsage{1000, 0}, ResourceUsage{1000, 0},
+                                                   ResourceUsage{1000, 0}, EvictionConfig{10, false, 600});
+    auto busy = std::make_shared<LoadGate>();
+    auto queued = std::make_shared<LoadGate>();
+    queued->finish = true;
+    auto first = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(busy), dlist.get(), true,
+                                                         true, true, -1ms, 0ms);
+    auto second = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(queued), dlist.get(), true,
+                                                          true, true, 20ms, 0ms);
+    std::future<std::shared_ptr<CellAccessor<SharedCell>>> a, b;
+    auto release = folly::makeGuard([&] { busy->Release(); });
+    a = std::async(std::launch::async, [first] { return first->PinOneCellDirect(nullptr, 0); });
+    ASSERT_TRUE(busy->Wait(&LoadGate::started));
+    b = std::async(std::launch::async, [second] { return second->PinOneCellDirect(nullptr, 0); });
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (SharedLoadTestFriend::Pins(*second, 0) != 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_EQ(SharedLoadTestFriend::Pins(*second, 0), 1);
+    EXPECT_EQ(b.wait_for(100ms), std::future_status::timeout);
+    busy->Release();
+    EXPECT_EQ(a.get()->get_cell_of(0)->id, 0);
+    EXPECT_EQ(b.get()->get_cell_of(0)->id, 0);
+    EXPECT_EQ(queued->calls, 1);
+}
+
+TEST_P(SharedLoadCancellationTest, LastWaiterCanCancelWhileProducerIsQueued) {
+    ScopedLoadThreads threads(1);
+    auto busy = std::make_shared<LoadGate>();
+    auto first = std::make_shared<CacheSlot<SharedCell>>(std::make_unique<SharedTranslator>(busy), dlist.get(), true,
+                                                         true, true, -1ms, 0ms);
+    folly::CancellationSource cancel;
+    OpContext caller(cancel.getToken());
+    Pending a, queued;
+    auto release = folly::makeGuard([&] { busy->Release(); });
+    a = std::async(std::launch::async, [first] { return first->PinOneCellDirect(nullptr, 0); });
+    ASSERT_TRUE(busy->Wait(&LoadGate::started));
+    queued = Pin(&caller);
+    ASSERT_TRUE(WaitPins(1));
+    cancel.requestCancellation();
+    EXPECT_EQ(queued.wait_for(1s), std::future_status::ready);
+    // Release the worker only after checking that the queued request has returned.
+    busy->Release();
+    ExpectCancelled(queued);
+    EXPECT_EQ(a.get()->get_cell_of(0)->id, 0);
+    SemiInlineGet(slot->WaitForLoads());
+    EXPECT_EQ(gate->calls, 0);
+    EXPECT_EQ(internal::DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST_P(SharedLoadCancellationTest, ConcurrentHitsAndEvictionKeepAccessorsValid) {
+    gate->Release();
+    Pin(nullptr).get().reset();
+    std::atomic<bool> stop{false};
+    auto evictor = std::async(std::launch::async, [&] {
+        while (!stop.load()) {
+            if (SharedLoadTestFriend::Pins(*slot, 0) == 0)
+                slot->ManualEvict(0);
+            std::this_thread::yield();
+        }
+    });
+    auto finish = folly::makeGuard([&] { stop = true; });
+    for (int i = 0; i < 100; ++i) {
+        auto accessor = Pin(nullptr).get();
+        EXPECT_EQ(accessor->get_cell_of(0)->id, 0);
+    }
+    stop = true;
+    evictor.get();
+    SemiInlineGet(slot->WaitForLoads());
+    slot->ManualEvict(0);
+    EXPECT_EQ(SharedLoadTestFriend::Pins(*slot, 0), 0);
+    EXPECT_EQ(internal::DListTestFriend::get_used_memory(*dlist), ResourceUsage{});
+}
+
 TEST(SharedLoadLifecycleTest, SynchronousNestedLoadsDoNotExhaustExecutor) {
+    ScopedLoadThreads threads(1);
     auto dlist = std::make_shared<internal::DList>(true, ResourceUsage{10000, 0}, ResourceUsage{10000, 0},
                                                    ResourceUsage{10000, 0}, EvictionConfig{10, true, 600});
     std::shared_ptr<CacheSlot<SharedCell>> slot;

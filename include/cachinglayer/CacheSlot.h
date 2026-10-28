@@ -321,6 +321,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     std::shared_ptr<CellAccessor<CellT>>
     PinInternal(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout,
                 bool single = false) {
+        if (auto resident = TryPinResident(ctx, cids))
+            return resident;
         auto pin_result = SemiInlineGet(PinShared(ctx, cids, timeout, single));
         auto all_pins = std::move(pin_result.first);
         if (ctx && storage_usage_tracking_enabled_) {
@@ -329,6 +331,33 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
+    }
+
+    std::shared_ptr<CellAccessor<CellT>>
+    TryPinResident(OpContext* ctx, const std::vector<cid_t>& cids) {
+        if (ctx && ctx->cancellation_token.isCancellationRequested())
+            ThrowInfo(ErrorCode::FollyCancel, "Cache wait cancelled");
+        // An external reservation owner must still wait for any producer to drain.
+        if (!self_reserve_)
+            return nullptr;
+        for (auto cid : cids) {
+            if (cid < 0 || cid >= static_cast<cid_t>(cells_.size()))
+                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells", cid, cells_.size());
+        }
+        std::vector<internal::ListNode::NodePin> pins;
+        pins.reserve(cids.size());
+        for (auto cid : cids) {
+            auto pin = cells_[cid]->try_pin();
+            if (!pin)
+                return nullptr;  // Release partial pins before entering the coordinated miss path.
+            pins.push_back(std::move(*pin));
+        }
+        for (auto cid : cids)
+            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                .Increment(cells_[cid]->local_storage_bytes());
+        if (ctx && storage_usage_tracking_enabled_)
+            ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
+        return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
     }
 
     [[nodiscard]] cid_t
@@ -476,14 +505,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     void
     FinishSharedLoad(const std::shared_ptr<SharedLoad>& load, folly::exception_wrapper error) {
-        if (load->deadline)
-            load->deadline->raise(folly::FutureCancellation());
         {
             std::lock_guard lock(loads_mutex_);
-            if (load->timed_out) {
-                error = folly::make_exception_wrapper<SegcoreError>(ErrorCode::FollyOtherException,
-                                                                    "Shared cache load timed out");
-            }
             // Keep the registry entry until errors have been published outside the lock.
             load->closing = true;
         }
@@ -504,30 +527,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     StartSharedLoad(std::shared_ptr<SharedLoad> load, std::chrono::milliseconds timeout) {
         auto self = this->shared_from_this();
         try {
-            // Admission keeps its original timeout. Give the whole operation its own
-            // budget rather than inheriting the first caller's cancellation/deadline.
-            auto budget = std::max(timeout, std::chrono::milliseconds(0)) +
-                          (loading_timeout_.count() > 0 ? loading_timeout_ : std::chrono::minutes(1));
-            std::weak_ptr<CacheSlot> weak_self = self;
-            std::weak_ptr<SharedLoad> weak_load = load;
-            load->deadline.emplace(folly::futures::sleep(budget, &internal::SharedLoadTimekeeper())
-                                       .via(&folly::InlineExecutor::instance())
-                                       .thenTry([weak_self, weak_load](folly::Try<folly::Unit>&& result) {
-                                           if (result.hasException())
-                                               return;
-                                           auto slot = weak_self.lock();
-                                           auto current = weak_load.lock();
-                                           if (!slot || !current)
-                                               return;
-                                           {
-                                               std::lock_guard lock(slot->loads_mutex_);
-                                               if (current->finished || current->closing)
-                                                   return;
-                                               current->closing = true;
-                                               current->timed_out = true;
-                                           }
-                                           current->cancellation.requestCancellation();
-                                       }));
+            // timeout applies only to resource admission, as before shared loading.
+            // The last departing waiter cancels the producer; no new I/O deadline.
             internal::SharedLoadExecutor().add([self, load, timeout] {
                 folly::exception_wrapper error;
                 try {

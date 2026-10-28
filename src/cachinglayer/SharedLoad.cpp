@@ -13,27 +13,35 @@
 
 #include <folly/executors/thread_factory/InitThreadFactory.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
-#include <folly/futures/ThreadWheelTimekeeper.h>
+
+#include <algorithm>
+#include <thread>
 
 namespace milvus::cachinglayer::internal {
-folly::Timekeeper&
-SharedLoadTimekeeper() {
-    static folly::ThreadWheelTimekeeper timekeeper;
-    return timekeeper;
+namespace {
+thread_local bool load_worker = false;
+}
+
+folly::CPUThreadPoolExecutor&
+SharedLoadThreadPool() {
+    // Match the default CPU-scaled load concurrency without eagerly creating all
+    // workers. Applications with a CPU quota or a different load budget should
+    // pass their effective concurrency to Manager::SetLoadPoolThreads().
+    static folly::CPUThreadPoolExecutor executor(
+        std::make_pair(size_t{5} * std::max(1u, std::thread::hardware_concurrency()), size_t{0}),
+        std::make_shared<folly::InitThreadFactory>(std::make_shared<folly::NamedThreadFactory>("mcl_load"),
+                                                   [] { load_worker = true; }));
+    return executor;
 }
 
 folly::Executor&
 SharedLoadExecutor() {
-    static thread_local bool load_worker = false;
     // A synchronous translator may load another slot. Do not queue that nested
     // producer behind the workers blocked waiting for it. It still owns its token
     // and context; the outer producer retains its resources until the nested call drains.
     if (load_worker)
         return folly::InlineExecutor::instance();
-    static folly::CPUThreadPoolExecutor executor(
-        8, std::make_shared<folly::InitThreadFactory>(std::make_shared<folly::NamedThreadFactory>("mcl_load"),
-                                                      [] { load_worker = true; }));
-    return executor;
+    return SharedLoadThreadPool();
 }
 
 SharedLoad::SharedLoad(const OpContext* caller) : context(cancellation.getToken()) {
